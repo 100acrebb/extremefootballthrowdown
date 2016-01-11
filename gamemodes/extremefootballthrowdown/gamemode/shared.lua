@@ -123,7 +123,8 @@ function GM:PlayerShouldTaunt(pl, actid)
 end
 
 function GM:PlayerCanHearPlayersVoice(listener, talker)
-	return self.TieBreaker or not self:InRound() or listener:Team() == TEAM_SPECTATOR or listener:Team() == TEAM_UNASSIGNED or listener:Team() == talker:Team(), false
+	return true
+	--return self.TieBreaker or not self:InRound() or listener:Team() == TEAM_SPECTATOR or listener:Team() == TEAM_UNASSIGNED or listener:Team() == talker:Team(), false
 end
 
 function GM:ShouldCollide(enta, entb)
