@@ -31,7 +31,17 @@ ball powerup: Ultimate Ball. The ball glows multiple colors. The carrier is immu
 ]]
 
 function GM:Think()
-	self.BaseClass.Think(self)
+	if not self.IsEndOfGame then
+		if CurTime() >= self:GetTimeLimit() and (not GAMEMODE.SuppressTimeLimit or CurTime() > GAMEMODE.SuppressTimeLimit) then
+			if self:GetOvertime() or team.GetScore(TEAM_RED) ~= team.GetScore(TEAM_BLUE) or self.OvertimeTime < 0 then
+				self:EndOfGame(true)
+			else
+				self:SetOvertime(true)
+			end
+		elseif self:GetOvertime() and team.GetScore(TEAM_RED) ~= team.GetScore(TEAM_BLUE) then
+			self:EndOfGame(true)
+		end
+	end
 
 	for _, pl in pairs(player.GetAll()) do
 		if pl:Alive() and pl:GetObserverMode() == OBS_MODE_NONE then
@@ -60,6 +70,42 @@ function GM:OnEndOfGame(bGamemodeVote)
 		net.WriteUInt(team.GetScore(TEAM_RED) > team.GetScore(TEAM_BLUE) and TEAM_RED or team.GetScore(TEAM_BLUE) > team.GetScore(TEAM_RED) and TEAM_BLUE or 0, 8)
 	net.Broadcast()
 end
+
+function GM:PreRoundStart(iNum)
+	if CurTime() >= GAMEMODE.GetTimeLimit() or GAMEMODE:HasReachedRoundLimit( iNum ) then
+		if not self:GetOvertime() and team.GetScore(TEAM_RED) == team.GetScore(TEAM_BLUE) then
+			self:SetOvertime(true)
+		else
+			GAMEMODE:EndOfGame(true)
+			return
+		end
+	end
+
+	if not GAMEMODE:CanStartRound(iNum) then
+		timer.Simple(1, function() GAMEMODE:PreRoundStart( iNum ) end)
+		return
+	end
+
+	timer.Simple(GAMEMODE.RoundPreStartTime, function() GAMEMODE:RoundStart() end)
+	SetGlobalInt("RoundNumber", iNum)
+	SetGlobalFloat("RoundStartTime", CurTime() + GAMEMODE.RoundPreStartTime)
+
+	GAMEMODE:ClearRoundResult()
+	GAMEMODE:OnPreRoundStart(GetGlobalInt("RoundNumber"))
+	GAMEMODE:SetInRound(true)
+end
+
+function GM:SetOvertime(ot)
+	SetGlobalBool("overtime", ot)
+
+	if ot then
+		self:StartRoundBasedGame()
+
+		net.Start("eft_overtime")
+		net.Broadcast()
+	end
+end
+GM.SetOverTime = GM.SetOvertime
 
 function GM:ReturnBall()
 	local ball = self:GetBall()
@@ -148,7 +194,9 @@ function GM:PlayerSpawn(pl)
 	pl.NextPainSound = 0
 	pl:SetLastAttacker(nil)
 
-	if pl:Team() == TEAM_RED then
+	local teamid = pl:Team()
+
+	if teamid == TEAM_RED then
 		pl:SetModel("models/player/barney.mdl")
 		pl:SetPlayerColor(Vector(2, 0, 0))
 	else
@@ -156,9 +204,16 @@ function GM:PlayerSpawn(pl)
 		pl:SetPlayerColor(Vector(0, 0, 1))
 	end
 
-	if not team.Joinable(pl:Team()) then return end
+	if not team.Joinable(teamid) then return end
 
-	if CurTime() < GetGlobalFloat("RoundStartTime") and pl:Team() ~= TEAM_SPECTATOR and pl:Team() ~= TEAM_CONNECTING then
+	if teamid == TEAM_RED or teamid == TEAM_BLUE then
+		pl:ShouldDropWeapon(false)
+		pl:Give("weapon_eft")
+	else
+		pl:StripWeapons()
+	end
+
+	if CurTime() < GetGlobalFloat("RoundStartTime") and teamid ~= TEAM_SPECTATOR and teamid ~= TEAM_CONNECTING then
 		pl:SetState(STATE_PREROUND)
 	else
 		pl:EndState()
@@ -317,10 +372,12 @@ function GM:SpawnRandomWeaponAtSpawn(class, teamid, silent)
 end
 
 function GM:SpawnRandomWeapon(silent)
-	if #ents.FindByClass("logic_norandomweapons") > 0 or self.TieBreaker then return end
+	if self.VeryCompetitive or #ents.FindByClass("logic_norandomweapons") > 0 or self.TieBreaker then return end
 
 	local weps = self:GetWeapons()
 	if #weps == 0 then return end
+
+	local overtime = self:IsOverTime()
 
 	-- Pick a random weapon. But also we need to pick based on weight. Some have a higher chance to drop.
 	local maxrandom = 0
@@ -328,9 +385,15 @@ function GM:SpawnRandomWeapon(silent)
 	for _, wepclass in pairs(weps) do
 		local tab = scripted_ents.GetStored(wepclass)
 		if tab then
-			local chance = tab.t.DropChance or 1
-			randpick[wepclass] = {maxrandom, maxrandom + chance}
-			maxrandom = maxrandom + chance
+			if (not overtime or tab.t.AllowDuringOverTime) and (not self.Competitive or tab.t.AllowInCompetitive) then
+				local currently_in_play = #ents.FindByClass(wepclass)
+				local max_in_play = tab.t.MaxActiveSets
+				if max_in_play == nil or currently_in_play < max_in_play * 2 then
+					local chance = tab.t.DropChance or 1
+					randpick[wepclass] = {maxrandom, maxrandom + chance}
+					maxrandom = maxrandom + chance
+				end
+			end
 		end
 	end
 
@@ -374,7 +437,16 @@ function GM:OnPlayerKnockedDownBy(pl, knocker)
 end
 
 function GM:Initialize()
-	self.BaseClass.Initialize(self)
+	util.AddNetworkString("PlayableGamemodes")
+	util.AddNetworkString("RoundAddedTime")
+	util.AddNetworkString("PlayableGamemodes")
+	util.AddNetworkString("fretta_teamchange")
+
+	timer.Simple(self.WarmUpLength, function() GAMEMODE:StartRoundBasedGame() GAMEMODE:EndWarmUp() end)
+
+	if self.AutomaticTeamBalance then
+		timer.Create("CheckTeamBalance", 30, 0, function() GAMEMODE:CheckTeamBalance() end)
+	end
 
 	resource.AddFile("materials/refract_ring.vmt")
 	resource.AddFile("materials/noxctf/sprite_bloodspray1.vmt")
@@ -398,8 +470,16 @@ function GM:Initialize()
 	util.AddNetworkString("eft_nearestgoal")
 	util.AddNetworkString("eft_teamscored")
 	util.AddNetworkString("eft_screencrack")
+	util.AddNetworkString("eft_overtime")
 
 	self:RegisterWeapons()
+end
+
+function GM:EndWarmUp()
+	for _, pl in pairs(player.GetAll()) do
+		pl:SetDeaths(0)
+		pl:SetFrags(0)
+	end
 end
 
 local function gsub_randomsound(a, b) return math.random(a, b) end
@@ -463,7 +543,7 @@ end
 local NextSwitchFromTeamToSpec = {}
 function GM:PlayerCanJoinTeam(ply, teamid)
 	local TimeBetweenSwitches = GAMEMODE.SecondsBetweenTeamSwitches or 10
-	if ( ply.LastTeamSwitch && RealTime()-ply.LastTeamSwitch < TimeBetweenSwitches ) then
+	if ( ply.LastTeamSwitch and RealTime()-ply.LastTeamSwitch < TimeBetweenSwitches ) then
 		ply.LastTeamSwitch = ply.LastTeamSwitch + 1;
 		ply:ChatPrint( Format( "Please wait %i more seconds before trying to change team again", (TimeBetweenSwitches - (RealTime()-ply.LastTeamSwitch)) + 1 ) )
 		return false
@@ -478,7 +558,7 @@ function GM:PlayerCanJoinTeam(ply, teamid)
 	end
 
 	-- Already on this team!
-	if ( ply:Team() == teamid ) then 
+	if ( ply:Team() == teamid ) then
 		ply:ChatPrint( "You're already on that team" )
 		return false
 	end
@@ -499,7 +579,7 @@ function GM:OnPreRoundStart(num)
 
 	self:RecalculateGoalCenters(TEAM_RED)
 	self:RecalculateGoalCenters(TEAM_BLUE)
-	
+
 	UTIL_StripAllPlayers()
 	UTIL_SpawnAllPlayers()
 
@@ -532,7 +612,7 @@ function GM:OnRoundResult(result, resulttext)
 end
 
 function GM:TeamScored(teamid, hitter, points, istouch)
-	if not teamid or not self:InRound() then return end
+	if not teamid or not self:InRound() or self:IsWarmUp() then return end
 
 	self:SlowTime(0.1, 2.5)
 

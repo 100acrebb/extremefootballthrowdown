@@ -42,7 +42,44 @@ cvars.AddChangeCallback("eft_gamelength", function(cvar, oldvalue, newvalue)
 	end
 end)
 
-GM.ScoreLimit = CreateConVar("eft_scorelimit", "7", FCVAR_REPLICATED + FCVAR_ARCHIVE + FCVAR_NOTIFY, "Time in minutes the map lasts for."):GetInt()
+GM.WarmUpLength = CreateConVar("eft_warmuplength", "60", FCVAR_REPLICATED + FCVAR_ARCHIVE + FCVAR_NOTIFY, "Time in seconds for the warmup phase to last."):GetInt()
+if GM.WarmUpLength <= 0 then GM.WarmUpLength = -1 end
+cvars.AddChangeCallback("eft_warmuplength", function(cvar, oldvalue, newvalue)
+	GAMEMODE.WarmUpLength = tonumber(newvalue) or 20
+	if GAMEMODE.WarmUpLength < 0 then
+		GAMEMODE.WarmUpLength = -1
+	end
+end)
+
+GM.OvertimeTime = CreateConVar("eft_overtime", "240", FCVAR_REPLICATED + FCVAR_ARCHIVE + FCVAR_NOTIFY, "Time in seconds for overtime to last."):GetInt()
+if GM.OvertimeTime <= 0 then GM.OvertimeTime = -1 end
+cvars.AddChangeCallback("eft_overtime", function(cvar, oldvalue, newvalue)
+	GAMEMODE.OvertimeTime = tonumber(newvalue) or 20
+	if GAMEMODE.OvertimeTime < 0 then
+		GAMEMODE.OvertimeTime = -1
+	end
+end)
+
+GM.OvertimeScoreBall = CreateConVar("eft_overtime_scoreball", "30", FCVAR_REPLICATED + FCVAR_ARCHIVE + FCVAR_NOTIFY, "During these last seconds of overtime, the ball will be a score ball powerup and the round will never end until someone scores."):GetInt()
+if GM.OvertimeScoreBall <= 0 then GM.OvertimeScoreBall = -1 end
+cvars.AddChangeCallback("eft_overtime_scoreball", function(cvar, oldvalue, newvalue)
+	GAMEMODE.OvertimeScoreBall = tonumber(newvalue) or 20
+	if GAMEMODE.OvertimeScoreBall < 0 then
+		GAMEMODE.OvertimeScoreBall = -1
+	end
+end)
+
+local compcvar = CreateConVar("eft_competitive", "0", FCVAR_REPLICATED + FCVAR_ARCHIVE + FCVAR_NOTIFY, "Use competitive ruleset. 1 = competitive (whitelisted items), 2 = very competitive (no items)")
+GM.Competitive = compcvar:GetInt() >= 1
+GM.VeryCompetitive = compcvar:GetInt() >= 2
+cvars.AddChangeCallback("eft_competitive", function(cvar, oldvalue, newvalue)
+	newvalue = tonumber(newvalue) or 0
+
+	GAMEMODE.Competitive = newvalue >= 1
+	GAMEMODE.VeryCompetitive = newvalue >= 2
+end)
+
+GM.ScoreLimit = CreateConVar("eft_scorelimit", "7", FCVAR_REPLICATED + FCVAR_ARCHIVE + FCVAR_NOTIFY, "How many points to win."):GetInt()
 if GM.ScoreLimit < 0 then GM.ScoreLimit = -1 end
 cvars.AddChangeCallback("eft_scorelimit", function(cvar, oldvalue, newvalue)
 	GAMEMODE.ScoreLimit = tonumber(newvalue) or 7
@@ -57,7 +94,7 @@ cvars.AddChangeCallback("eft_pity", function(cvar, oldvalue, newvalue)
 end)
 
 function team.HasPity(teamid)
-	return GAMEMODE.Pity > 0 and team.GetScore(teamid == TEAM_RED and TEAM_BLUE or TEAM_RED) >= team.GetScore(teamid) + GAMEMODE.Pity
+	return GAMEMODE:IsOvertime() or GAMEMODE.Pity > 0 and team.GetScore(teamid == TEAM_RED and TEAM_BLUE or TEAM_RED) >= team.GetScore(teamid) + GAMEMODE.Pity
 end
 
 GM.RoundLimit = -1
@@ -105,17 +142,36 @@ include("sh_obj_player_extend.lua")
 
 IncludePlayerClasses()
 
+local CurTime = CurTime
+local FrameTime = FrameTime
+local math_min = math.min
+local math_max = math.max
+local math_abs = math.abs
+local math_AngleDifference = math.AngleDifference
+local math_NormalizeAngle = math.NormalizeAngle
+local math_Clamp = math.Clamp
+local math_floor = math.floor
+local math_random = math.random
+local pairs = pairs
+local game_GetTimeScale = game.GetTimeScale
+
+function GM:InRound() return GetGlobalBool("InRound", true) end
+
 function GM:EntityEmitSound(snd)
-	if game.GetTimeScale() ~= 1 then
+	if game_GetTimeScale() ~= 1 then
 		local ent = snd.Entity
 		if ent and ent:IsValid() then
 			if ent:IsPlayer() or ent:GetMoveType() ~= MOVETYPE_NONE then
-				snd.Pitch = math.Clamp(snd.Pitch * math.Clamp(game.GetTimeScale() ^ 0.6, 0.4, 3), 10, 255)
+				snd.Pitch = math_Clamp(snd.Pitch * math_Clamp(game_GetTimeScale() ^ 0.6, 0.4, 3), 10, 255)
 				snd.DSP = 21
 				return true
 			end
 		end
 	end
+end
+
+function GM:IsWarmUp()
+	return CurTime() <= self.WarmUpLength
 end
 
 function GM:PlayerShouldTaunt(pl, actid)
@@ -133,6 +189,34 @@ function GM:ShouldCollide(enta, entb)
 	end
 
 	return true
+end
+
+function GM:GetOvertime()
+	return GetGlobalBool("overtime", false)
+end
+GM.GetOverTime = GM.GetOvertime
+GM.IsOvertime = GM.GetOvertime
+GM.IsOverTime = GM.GetOvertime
+
+function GM:GetTimeLimit()
+	if GAMEMODE.GameLength > 0 then
+		local time = GAMEMODE.GameLength * 60
+
+		if GAMEMODE.WarmUpLength > 0 then
+			time = time + GAMEMODE.WarmUpLength
+		end
+		if GAMEMODE.OvertimeTime > 0 and GAMEMODE:GetOvertime() then
+			time = time + GAMEMODE.OvertimeTime
+
+			if GAMEMODE.OvertimeScoreBall > 0 and CurTime() < time + 120 then -- Just in case the map breaks, give 2 minutes max for someone to touch the score ball.
+				time = math_max(time, CurTime() + 0.1)
+			end
+		end
+
+		return time
+	end
+
+	return -1
 end
 
 function GM:RecalculateGoalCenters(teamid)
@@ -180,7 +264,7 @@ function GM:GetBallHome()
 	if ball:IsValid() then
 		return ball:GetHome()
 	end
-	
+
 	return vector_origin
 end
 
@@ -251,7 +335,7 @@ function GM:Move(pl, move)
 		move:SetMaxClientSpeed(move:GetMaxClientSpeed() * 0.2)
 	end
 
-	local ret = pl:CallStateFunction("PostMove", move)
+	ret = pl:CallStateFunction("PostMove", move)
 	if ret then
 		if ret == MOVE_OVERRIDE then return true end
 	end
@@ -275,15 +359,19 @@ function GM:GetWeapons()
 end
 
 function GM:DefaultMove(pl, move)
+	--[[local time = UnPredictedCurTime()
+	local delta = time - (pl.LastMove or 0)
+	pl.LastMove = time]]
+
 	local carry = pl:GetCarry()
 	if carry:IsValid() and carry.Move and carry:Move(pl, move) then return end
 
 	if move:GetForwardSpeed() > 0 then
 		local curvel = move:GetVelocity()
 		local maxspeed = move:GetMaxSpeed()
-		local curspeed = math.min(maxspeed, curvel:Length2D())
+		local curspeed = math_min(maxspeed, curvel:Length2D())
 		local acceleration = carry:IsValid() and carry.GetAcceleration and carry:GetAcceleration() or 1
-		local newspeed = math.max(curspeed + FrameTime() * (15 + 0.5 * (400 - curspeed)) * acceleration, 100) * (1 - math.max(0, math.abs(math.AngleDifference(move:GetMoveAngles().yaw, curvel:Angle().yaw)) - 4) / 360)
+		local newspeed = math_max(curspeed + FrameTime()--[[delta]] * (15 + 0.5 * (400 - curspeed)) * acceleration, 100) * (1 - math_max(0, math_abs(math_AngleDifference(move:GetMoveAngles().yaw, curvel:Angle().yaw)) - 4) / 360)
 
 		move:SetSideSpeed(0)
 		move:SetMaxSpeed(newspeed)
@@ -302,9 +390,9 @@ function GM:KeyPress(pl, key)
 	local carry = pl:GetCarry()
 	if carry:IsValid() and carry.KeyPress and carry:KeyPress(pl, key) then return end
 
-	if key == IN_ATTACK then
+	--[[if key == IN_ATTACK then
 		if pl:CanMelee() then
-			local state = STATE_PUNCH1
+			local state = STATE_PUNCH1]]
 			--[[for _, tr in pairs(pl:GetTargets()) do
 				local hitent = tr.Entity
 				if hitent:IsPlayer() and hitent:GetState() == STATE_KNOCKEDDOWN then
@@ -313,8 +401,8 @@ function GM:KeyPress(pl, key)
 				end
 			end]]
 
-			pl:SetState(state, STATES[state].Time)
-		end
+			--pl:SetState(state--[[, STATES[state].Time]])
+		--[[end
 	elseif key == IN_ATTACK2 then
 		if pl:CanMelee() then
 			local vel = pl:GetVelocity()
@@ -324,7 +412,7 @@ function GM:KeyPress(pl, key)
 				pl:SetState(STATE_DIVETACKLE)
 			end
 		end
-	elseif key == IN_WALK then
+	else]]if key == IN_WALK then
 		if SERVER and pl:IsIdle() and not pl:IsCarrying() then
 			if pl:OnGround() then
 				local dir = vector_origin
@@ -385,12 +473,12 @@ function GM:OnPlayerHitGround(pl, inwater, hitfloater, speed)
 
 		if hitfloater then damage = damage / 2 end
 
-		if math.floor(damage) > 0 then
+		if math_floor(damage) > 0 then
 			if damage >= 20 then
 				pl:KnockDown()
 			end
 			pl:TakeSpecialDamage(damage, DMG_FALL, game.GetWorld(), game.GetWorld(), pl:GetPos())
-			pl:EmitSound("player/pl_fallpain"..(math.random(0, 1) == 1 and 3 or 1)..".wav")
+			pl:EmitSound("player/pl_fallpain"..(math_random(0, 1) == 1 and 3 or 1)..".wav")
 		end
 	end
 
@@ -418,23 +506,23 @@ function util.Blood(pos, amount, dir, force, noprediction)
 		effectdata:SetOrigin(pos)
 		effectdata:SetMagnitude(amount)
 		effectdata:SetNormal(dir)
-		effectdata:SetScale(math.max(128, force))
+		effectdata:SetScale(math_max(128, force))
 	util.Effect("bloodstream", effectdata, nil, noprediction)
 end
 
 function util.Chance(chance)
-	return chance <= math.random(100)
+	return chance <= math_random(100)
 end
 
 function util.Probability(prob)
-	return prob <= 1 or math.random(prob) == prob
+	return prob <= 1 or math_random(prob) == prob
 end
 
 function util.ToMinutesSeconds(seconds)
-	local minutes = math.floor(seconds / 60)
+	local minutes = math_floor(seconds / 60)
 	seconds = seconds - minutes * 60
 
-    return string.format("%02d:%02d", minutes, math.floor(seconds))
+    return string.format("%02d:%02d", minutes, math_floor(seconds))
 end
 
 function util.ExplosiveDamage(inflictor, attacker, pos, range, damage, damagetype, forcemultiplier, forceoverride)
@@ -447,7 +535,7 @@ function util.ExplosiveDamage(inflictor, attacker, pos, range, damage, damagetyp
 
 		local entpos = ent:NearestPoint(pos)
 		if util.IsVisible(entpos, pos) then
-			local dmg = math.Clamp(1 - entpos:Distance(pos) / range, 0, 1) ^ 0.5 * damage
+			local dmg = math_Clamp(1 - entpos:Distance(pos) / range, 0, 1) ^ 0.5 * damage
 			local force = (ent:IsPlayer() and 1 or 0.3) * (forceoverride or dmg * 15 * (forcemultiplier or 1))
 			ent:ThrowFromPosition(pos + Vector(0, 0, -24), force, force >= 150, attacker)
 			ent:TakeSpecialDamage(damage, damagetype, attacker, inflictor, pos)
@@ -469,12 +557,12 @@ function util.IsVisible(posa, posb)
 end
 
 function util.ToMinutesSecondsMilliseconds(seconds)
-	local minutes = math.floor(seconds / 60)
+	local minutes = math_floor(seconds / 60)
 	seconds = seconds - minutes * 60
 
-	local milliseconds = math.floor(seconds % 1 * 100)
+	local milliseconds = math_floor(seconds % 1 * 100)
 
-    return string.format("%02d:%02d.%02d", minutes, math.floor(seconds), milliseconds)
+    return string.format("%02d:%02d.%02d", minutes, math_floor(seconds), milliseconds)
 end
 
 function team.HasPlayers(teamid)
@@ -523,14 +611,14 @@ function util.LimitTurning(oldangles, newangles, angle_per_dt, dt)
 	local maxdiff = dt * angle_per_dt
 	local mindiff = -maxdiff
 
-	local diff = math.AngleDifference(newangles.yaw, oldangles.yaw)
+	local diff = math_AngleDifference(newangles.yaw, oldangles.yaw)
 	if diff > maxdiff or diff < mindiff then
-		newangles.yaw = math.NormalizeAngle(oldangles.yaw + math.Clamp(diff, mindiff, maxdiff))
+		newangles.yaw = math_NormalizeAngle(oldangles.yaw + math_Clamp(diff, mindiff, maxdiff))
 	end
 
-	diff = math.AngleDifference(newangles.pitch, oldangles.pitch)
+	diff = math_AngleDifference(newangles.pitch, oldangles.pitch)
 	if diff > maxdiff or diff < mindiff then
-		newangles.pitch = math.NormalizeAngle(oldangles.pitch + math.Clamp(diff, mindiff, maxdiff))
+		newangles.pitch = math_NormalizeAngle(oldangles.pitch + math_Clamp(diff, mindiff, maxdiff))
 	end
 
 	return newangles
